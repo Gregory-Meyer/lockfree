@@ -9,11 +9,10 @@
 #include <optional>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace lf {
 namespace queue {
-
-struct Empty { };
 
 template <typename T>
 struct Node {
@@ -27,13 +26,10 @@ struct Node {
     explicit Node(std::initializer_list<U> list, Ts &&...ts)
     noexcept(std::is_nothrow_constructible_v<T, std::initializer_list<U>&, Ts...>);
 
-    explicit Node(Empty) noexcept;
+    explicit Node(std::monostate) noexcept;
 
     std::shared_ptr<Node> next;
-    union {
-        T value;
-        Empty e;
-    };
+    std::variant<std::monostate, T> value;
 };
 
 } // namespace queue
@@ -41,7 +37,7 @@ struct Node {
 template <typename T>
 class Queue {
 public:
-    Queue() noexcept = default;
+    static_assert(std::is_copy_constructible_v<T>);
 
     void push(const T &value);
 
@@ -56,7 +52,7 @@ public:
     > = 0>
     void emplace(std::initializer_list<U> list, Ts &&...ts);
 
-    std::optional<T> pop() noexcept;
+    std::optional<T> pop() noexcept(std::is_nothrow_copy_constructible_v<T>);
 
 private:
     using Node = queue::Node<T>;
@@ -64,7 +60,7 @@ private:
 
     void push(std::unique_ptr<Node> node_ptr) noexcept;
 
-    NodePtr head_{ std::make_shared<Node>(queue::Empty{ }) };
+    NodePtr head_{ std::make_shared<Node>(std::monostate{ }) };
     NodePtr tail_{ head_ };
 };
 
@@ -94,10 +90,10 @@ void Queue<T>::emplace(std::initializer_list<U> list, Ts &&...ts) {
 }
 
 template <typename T>
-std::optional<T> Queue<T>::pop() noexcept {
+std::optional<T> Queue<T>::pop() noexcept(std::is_nothrow_copy_constructible_v<T>) {
     while (true) {
-        const NodePtr head{ std::atomic_load(&head_) };
-        const NodePtr tail{ std::atomic_load(&tail_) };
+        NodePtr head{ std::atomic_load(&head_) };
+        NodePtr tail{ std::atomic_load(&tail_) };
         const NodePtr next{ std::atomic_load(&head->next) };
 
         if (head != std::atomic_load(&head_)) {
@@ -105,15 +101,15 @@ std::optional<T> Queue<T>::pop() noexcept {
         }
 
         if (head == tail) {
-            if (next) {
+            if (!next) {
                 return std::nullopt;
             }
 
-            std::atomic_compare_exchange_weak(&tail_, tail, next);
+            std::atomic_compare_exchange_weak(&tail_, &tail, next);
         } else {
-            const std::optional<T> value{ next->value };
+            const std::optional<T> value{ std::get<T>(next->value) };
 
-            if (std::atomic_compare_exchange_weak(&head_, head, next)) {
+            if (std::atomic_compare_exchange_weak(&head_, &head, next)) {
                 return value;
             }
         }
@@ -129,22 +125,22 @@ void Queue<T>::push(std::unique_ptr<Node> node_ptr) noexcept {
 
     while (true) {
         tail = std::atomic_load(&tail_);
-        const NodePtr next{ std::atomic_load(tail->next) };
+        NodePtr next{ std::atomic_load(&tail->next) };
 
         if (tail != std::atomic_load(&tail_)) {
             continue;
         }
 
         if (!next) {
-            if (std::atomic_compare_exchange_weak(&tail->next, next, new_tail)) {
+            if (std::atomic_compare_exchange_weak(&tail->next, &next, new_tail)) {
                 break;
             }
         } else {
-            std::atomic_compare_exchange_weak(&tail_, tail, next);
+            std::atomic_compare_exchange_weak(&tail_, &tail, next);
         }
     }
 
-    std::atomic_compare_exchange_weak(&tail_, tail, new_tail);
+    std::atomic_compare_exchange_weak(&tail_, &tail, new_tail);
 }
 
 namespace queue {
@@ -152,7 +148,7 @@ namespace queue {
 template <typename T>
 template <typename ...Ts, std::enable_if_t<std::is_constructible_v<T, Ts...>, int>>
 Node<T>::Node(Ts &&...ts) noexcept(std::is_nothrow_constructible_v<T, Ts...>)
-: value(std::forward<Ts>(ts)...) { }
+: value(std::in_place_type<T>, std::forward<Ts>(ts)...) { }
 
 template <typename T>
 template <typename U, typename ...Ts, std::enable_if_t<
@@ -161,10 +157,10 @@ template <typename U, typename ...Ts, std::enable_if_t<
 >>
 Node<T>::Node(std::initializer_list<U> list, Ts &&...ts)
 noexcept(std::is_nothrow_constructible_v<T, std::initializer_list<U>&, Ts...>)
-: value(list, std::forward<Ts>(ts)...) { }
+: value(std::in_place_type<T>, list, std::forward<Ts>(ts)...) { }
 
 template <typename T>
-Node<T>::Node(Empty) noexcept : e{ } { }
+Node<T>::Node(std::monostate) noexcept : value(std::in_place_type<std::monostate>) { }
 
 } // namespace queue
 } // namespace lf
